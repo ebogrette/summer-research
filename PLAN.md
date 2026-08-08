@@ -13,21 +13,25 @@ comparable access. Pretending they do is how this kind of project rots.
 
 | | Access path | Auth | Native keyword search? | Practical limit |
 |---|---|---|---|---|
-| **4chan** | Official read-only JSON API (`a.4cdn.org`) | none | **No** | ~1 req/sec, `If-Modified-Since` required by their rules |
+| **4chan (archive)** | 4plebs FoolFuuka search API (`archive.4plebs.org/_/api/chan/search/`) | none | **Yes** | ~1 req/sec; archive covers a subset of boards |
 | **Reddit** | Official API (OAuth2, script app) | client id/secret | **Yes** (`/search`, `/r/{sub}/search`) | ~100 req/min per client, ~1000-result pagination ceiling |
 | **X/Twitter** | API v2 recent search | paid tier bearer token | **Yes** | tier-gated volume; free tier does **not** include search |
 
 Consequences that drive the architecture:
 
-- **4chan needs crawl-then-filter.** There is no server-side search. You pull the
-  board catalog, pull threads, and match keywords locally. This is slow and I/O
-  bound, which is why the API needs an async job mode (§6.3), not just synchronous
-  request/response.
-- **4chan content is ephemeral.** Threads are pruned within hours to days. If you
-  care about history, you must either poll continuously and persist, or read from a
-  third-party archive (4plebs, desuarchive) which *does* offer a search endpoint
-  (FoolFuuka API) but only covers a subset of boards. Plan for a
-  `FourChanArchiveAdapter` as a sibling module, not a rewrite.
+- **4chan search runs server-side against the 4plebs archive.** The live 4chan API
+  (`a.4cdn.org`) has no search endpoint, so we query the 4plebs FoolFuuka API instead
+  — it indexes full post history and returns matches directly. No local catalog crawl,
+  no client-side keyword filtering. The matcher still runs over the returned text to
+  populate `matched_keywords` (why a result matched), exactly as the reddit adapter
+  does — but it is not what *selects* results.
+- **The archive covers a subset of boards.** 4plebs archives ~20 boards (`pol`, `tv`,
+  `sp`, `int`, `x`, `adv`, …), not all ~70. A request for an unarchived board returns
+  nothing from this source; report that rather than silently falling back to a live
+  crawl. If real-time or unarchived-board coverage is ever needed, a
+  `FourChanLiveAdapter` that crawls `a.4cdn.org` catalogs and filters locally is a
+  sibling module (capability `CRAWL_FILTER`), not a rewrite — but it is out of scope
+  until there's a reason.
 - **X/Twitter is the risk item.** There is no free, ToS-compliant, reliable path to
   keyword search. Verify current API pricing before committing — it has changed
   repeatedly. Design the module as a thin interface over a swappable backend
@@ -164,8 +168,8 @@ class SearchQuery:
 ```python
 # sources/base.py
 class SearchCapability(StrEnum):
-    NATIVE = "native"          # platform searches server-side (reddit, twitter)
-    CRAWL_FILTER = "crawl"     # we fetch broadly and filter locally (4chan)
+    NATIVE = "native"          # server-side search (reddit, twitter, 4chan via 4plebs)
+    CRAWL_FILTER = "crawl"     # we fetch broadly and filter locally (optional 4chan live crawler)
 
 class SourceAdapter(Protocol):
     name: str
@@ -189,38 +193,55 @@ from taking down the whole query.
 
 ## 5. Per-source modules
 
-### 5.1 `sources/fourchan.py` — capability: `CRAWL_FILTER`
+### 5.1 `sources/fourchan.py` — capability: `NATIVE` (via the 4plebs archive)
 
-Endpoints (all under `https://a.4cdn.org`):
+4chan itself offers no search, so this adapter reads from the 4plebs archive, which
+runs a FoolFuuka instance with a real full-text index. Web search URLs look like
+`https://archive.4plebs.org/_/search/text/hitler/`; the adapter uses the equivalent
+JSON API rather than scraping that HTML:
 
-- `/boards.json` — board list + metadata; cache for hours
-- `/{board}/catalog.json` — every thread on the board with a preview of replies
-- `/{board}/thread/{no}.json` — full thread with all posts
+- `GET https://archive.4plebs.org/_/api/chan/search/?text={q}&boards={csv}&page={n}`
+  — full-text search, returns matching posts newest-first.
+- `GET https://archive.4plebs.org/_/api/chan/thread/?board={b}&num={op}` — full
+  thread, only when `include_replies` needs the surrounding context.
+
+Search params mapped from `SearchQuery`: `boards` (from `q.containers`), `start` /
+`end` dates (from `q.since` / `q.until`), `order` (`asc`/`desc`), `page` for paging.
 
 Algorithm:
 
-1. Resolve target boards: `q.containers` if given, else a configured default set.
-   Refuse to crawl all ~70 boards implicitly — that is minutes of work per request.
-2. Fetch each board catalog. Match keywords against OP `sub` + `com` and the
-   preview replies already present in the catalog.
-3. For threads with a catalog-level hit, or (if `deep_scan` is on) for all threads,
-   fetch the full thread and match every post.
-4. Yield matching posts, capped at `q.limit`.
+1. Resolve boards: `q.containers` filtered to those 4plebs actually archives (keep a
+   static allowlist in config). Drop any unarchived board and note it; if none remain,
+   yield nothing (the source contributed no coverage, not an error).
+2. Translate the query text into FoolFuuka's single `text` string — join `q.keywords`
+   with spaces for `any`, quote the whole thing for `phrase`. There is no native AND,
+   so for `all` pass the keywords and enforce `all` with the local matcher over the
+   returned text.
+3. Page through results (`page=1,2,…`) until `q.limit` is reached or a page returns
+   empty. Sequence requests through the shared token bucket (~1 req/sec).
+4. Build a `Post` per record; re-run the matcher over `title` + comment to fill
+   `matched_keywords`, and set `match_field = "native"` (the archive did the matching).
 
 Implementation notes:
 
-- **Sequence the requests.** ~1 req/sec, single connection. Use the shared token
-  bucket; do not parallelize 4chan.
-- **Send `If-Modified-Since`** and treat 304 as "reuse cached copy". Their API rules
-  ask for this explicitly and it cuts traffic dramatically on repeat polls.
-- Media URLs are built, not given: `https://i.4cdn.org/{board}/{tim}{ext}`, thumb is
-  `{tim}s.jpg`. Post permalink: `https://boards.4chan.org/{board}/thread/{no}#p{id}`.
-- Threading: OP has no `resto`; replies have `resto` = thread number. Map
-  `resto == 0` → `parent_id = None`, `thread_id = no`.
-- `sub`/`com` are optional keys — a post with an image and no text has neither.
-  Default to `""`, never `KeyError`.
-- Catalog-only mode should be the default for API-facing requests; deep scan belongs
-  in the job queue.
+- **Response shape**: a page arrives as `{"0": {"posts": [...]}, ...}` (FoolFuuka wraps
+  each page under a numeric key). Each post carries `num`, `thread_num`, `op` (1/0),
+  `board` (`{"shortname": "pol"}`), `timestamp` (unix), `comment_sanitized`, `title`,
+  `name`, and a nested `media` object (`media_link`, `thumb_link`, `media_w`,
+  `media_h`). Every one of these is optional — guard each key, never `KeyError`.
+- Threading: `op == 1` → `parent_id = None`, `thread_id = num`; otherwise
+  `thread_id = thread_num`, `parent_id = thread_num`.
+- IDs are strings. Permalink:
+  `https://archive.4plebs.org/{board}/thread/{thread_num}/#{num}`.
+- **Use the archive's media links directly** (`media_link` / `thumb_link`) — they are
+  already absolute. Do not rebuild `i.4cdn.org` URLs: the original file is often gone
+  from 4chan but still served by the archive.
+- `comment_sanitized` is mostly plaintext but can still carry backlink/quote markup —
+  run it through the same strip-to-text pass, preserving `>quote` lines.
+- **Sequence the requests.** ~1 req/sec, single connection; do not parallelize this
+  source. FoolFuuka enforces its own rate limit and can 503 under load, so lean on the
+  shared client's backoff and `Retry-After` handling. `If-Modified-Since` / short-TTL
+  caching still helps on repeated identical searches.
 
 ### 5.2 `sources/reddit.py` — capability: `NATIVE`
 
@@ -338,7 +359,8 @@ failed, 200 with populated `errors` when only some did.
 
 ### 6.3 Async jobs
 
-Deep 4chan crawls take minutes and will blow past any sane HTTP timeout. Phase 6
+Large archive result sets (many pages) — or an optional live-crawl backfill of
+unarchived boards — can run long enough to blow past any sane HTTP timeout. Phase 6
 adds a job mode. Start with a `ThreadPoolExecutor` + SQLite job table — that is
 sufficient for single-process use and avoids a Redis/Celery dependency until there's
 a reason for one. Keep the job interface narrow enough that swapping in RQ or Celery
@@ -377,7 +399,7 @@ later is a contained change.
 |---|---|---|
 | **0** | Fresh 3.11 venv, `pyproject.toml`, package skeleton, `.env.example`, pytest wired | `pytest` runs green on an empty suite |
 | **1** | `models.py`, `matching.py`, `errors.py`, `http.py`, `ratelimit.py`, `config.py` | `Post` round-trips to JSON; matcher tests pass |
-| **2** | `sources/fourchan.py` + fixture tests | Catalog search over a board returns normalized `Post`s offline |
+| **2** | `sources/fourchan.py` (4plebs archive search) + fixture tests | Archive text search over a board returns normalized `Post`s offline |
 | **3** | `sources/reddit.py` + OAuth + fixture tests | Keyword search returns normalized `Post`s; token refresh covered |
 | **4** | `registry.py`, `pipeline.py`, Flask app, `/health` `/sources` `/search` | `curl "localhost:5000/search?q=foo&sources=reddit,4chan"` returns the envelope |
 | **5** | `sources/twitter.py` with `NullBackend` default | Unconfigured source reports `unavailable`; API backend swappable |
@@ -392,12 +414,12 @@ treat 5–7 as follow-on.
 
 ## 9. Decisions worth making before coding
 
-1. **Persistence from day one, or later?** The plan defers it to Phase 6. If the
-   real goal is longitudinal monitoring of 4chan (where content vanishes), pull
-   SQLite forward to Phase 2 instead — retrofitting is more painful than starting
-   with it.
-2. **Default 4chan boards.** Crawling is expensive and unbounded; pick an explicit
-   default set in config rather than "all".
+1. **Persistence from day one, or later?** The plan defers it to Phase 6. Reading 4chan
+   through the 4plebs archive means history is already persisted upstream, which takes
+   some pressure off — but if the goal is your own longitudinal store (or covering
+   boards 4plebs doesn't archive), pull SQLite forward to Phase 2 instead.
+2. **Default 4chan boards.** Pick an explicit default set drawn from the boards 4plebs
+   archives (e.g. `pol`, `tv`) rather than searching every archived board by default.
 3. **X/Twitter budget.** Confirm before Phase 5 whether a paid tier is on the table.
    If not, `NullBackend` is the permanent answer and that's worth knowing early.
 4. **Auth on the Flask API itself.** Fine to skip for localhost; required before

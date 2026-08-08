@@ -18,7 +18,7 @@ def test_defaults_when_env_empty(monkeypatch):
     s = Settings.from_env(dotenv_path=None)
     assert not s.reddit_configured
     assert not s.twitter_configured
-    assert s.fourchan_default_boards == ["g", "news"]
+    assert s.fourchan_default_boards == ["pol", "tv"]
     assert s.http_timeout == 20.0
 
 

@@ -46,8 +46,8 @@ class Settings:
     # Twitter
     twitter_bearer_token: str | None = None
 
-    # 4chan
-    fourchan_default_boards: list[str] = field(default_factory=lambda: ["g", "news"])
+    # 4chan — must be boards the 4plebs archive actually covers (see sources/fourchan.py)
+    fourchan_default_boards: list[str] = field(default_factory=lambda: ["pol", "tv"])
 
     # HTTP / caching
     http_timeout: float = 20.0
@@ -70,7 +70,7 @@ class Settings:
             return val if val else None
 
         boards_raw = os.environ.get("FOURCHAN_DEFAULT_BOARDS")
-        boards = _split_csv(boards_raw) if boards_raw else ["g", "news"]
+        boards = _split_csv(boards_raw) if boards_raw else ["pol", "tv"]
 
         return cls(
             reddit_client_id=_get("REDDIT_CLIENT_ID"),

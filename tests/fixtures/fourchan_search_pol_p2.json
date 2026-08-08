@@ -1,0 +1,19 @@
+{
+  "0": {
+    "posts": [
+      {
+        "doc_id": "5",
+        "num": "14000",
+        "subnum": "0",
+        "thread_num": "14000",
+        "op": 1,
+        "timestamp": 1600002000,
+        "board": { "shortname": "pol" },
+        "name": "Anonymous",
+        "title": "Hitler biography recommendations",
+        "comment_sanitized": "Which Hitler biography is best?",
+        "nreplies": 12
+      }
+    ]
+  }
+}
